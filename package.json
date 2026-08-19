@@ -1,0 +1,315 @@
+// server.js
+// Minimal Express backend for PricePro.
+//
+// Routes:
+//   POST /api/create-checkout-session  - starts a Stripe subscription checkout
+//   POST /api/stripe-webhook           - receives Stripe webhook events
+//   GET  /api/me                       - returns the caller's current tier
+//
+// See README.md for setup, env vars, and the Stripe <-> Supabase wiring notes.
+
+require('dotenv').config();
+
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const Stripe = require('stripe');
+
+const { supabaseAdmin } = require('./supabaseClient');
+
+const PORT = process.env.PORT || 3000;
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_SELLER_PRICE_ID = process.env.STRIPE_SELLER_PRICE_ID;
+const STRIPE_BUSINESS_PRICE_ID = process.env.STRIPE_BUSINESS_PRICE_ID;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+
+// Fill this in with your real deployed frontend origin(s).
+// Example: 'https://pricepro.example.com'
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'https://MYFRONTENDURL.com';
+
+if (!STRIPE_SECRET_KEY) {
+  // eslint-disable-next-line no-console
+  console.warn('[server] STRIPE_SECRET_KEY is not set. Stripe calls will fail.');
+}
+
+const stripe = new Stripe(STRIPE_SECRET_KEY || 'sk_test_missing', {
+  apiVersion: '2024-06-20',
+});
+
+const app = express();
+
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+// Update FRONTEND_ORIGIN (env var) or this array once you know your real
+// frontend URL(s). You can pass a comma-separated list via FRONTEND_ORIGIN.
+const allowedOrigins = FRONTEND_ORIGIN.split(',').map((o) => o.trim());
+
+app.use(
+  cors({
+    origin: allowedOrigins,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Body parsing
+// ---------------------------------------------------------------------------
+// IMPORTANT: the Stripe webhook route needs the RAW request body (a Buffer)
+// to verify the signature, so it must NOT go through the JSON body parser.
+// We register the raw parser only on that route, and JSON parsing on all
+// other routes.
+app.use('/api/stripe-webhook', bodyParser.raw({ type: 'application/json' }));
+app.use(bodyParser.json());
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts a Bearer token from the Authorization header.
+ */
+function getBearerToken(req) {
+  const header = req.headers.authorization || '';
+  const [scheme, token] = header.split(' ');
+  if (scheme !== 'Bearer' || !token) return null;
+  return token;
+}
+
+/**
+ * Verifies a Supabase JWT and returns the associated user (or null).
+ */
+async function getUserFromToken(token) {
+  if (!token) return null;
+  const { data, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !data || !data.user) return null;
+  return data.user;
+}
+
+/**
+ * Maps a tier name to the corresponding Stripe Price ID.
+ */
+function priceIdForTier(tier) {
+  if (tier === 'seller') return STRIPE_SELLER_PRICE_ID;
+  if (tier === 'business') return STRIPE_BUSINESS_PRICE_ID;
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+app.get('/health', (req, res) => {
+  res.json({ ok: true, service: 'pricepro-backend' });
+});
+
+/**
+ * POST /api/create-checkout-session
+ * Body: { tier: 'seller' | 'business', token: '<supabase JWT>' }
+ * Returns: { url: '<stripe checkout url>' }
+ */
+app.post('/api/create-checkout-session', async (req, res) => {
+  try {
+    const { tier, token } = req.body || {};
+
+    if (!tier || (tier !== 'seller' && tier !== 'business')) {
+      return res.status(400).json({ error: "tier must be 'seller' or 'business'" });
+    }
+    if (!token) {
+      return res.status(401).json({ error: 'Missing Supabase auth token' });
+    }
+
+    const user = await getUserFromToken(token);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid or expired auth token' });
+    }
+
+    const priceId = priceIdForTier(tier);
+    if (!priceId) {
+      return res.status(500).json({ error: `No Stripe price configured for tier "${tier}"` });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${allowedOrigins[0]}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${allowedOrigins[0]}/billing-cancelled`,
+      // Metadata lets the webhook know which Supabase user and tier this
+      // checkout session belongs to.
+      metadata: {
+        supabase_user_id: user.id,
+        tier,
+      },
+      // Also stamp the same metadata onto the subscription itself. This is
+      // what lets customer.subscription.deleted (which does not include the
+      // Checkout Session) still be traced back to a Supabase user later.
+      subscription_data: {
+        metadata: {
+          supabase_user_id: user.id,
+          tier,
+        },
+      },
+      // Reuse an existing Stripe customer for this user if we already know
+      // one, otherwise let Stripe create one and ask for their email.
+      customer_email: user.email || undefined,
+    });
+
+    return res.json({ url: session.url });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[create-checkout-session] error:', err);
+    return res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+/**
+ * POST /api/stripe-webhook
+ * Requires the raw request body (see body-parser setup above) to verify the
+ * Stripe-Signature header against STRIPE_WEBHOOK_SECRET.
+ */
+app.post('/api/stripe-webhook', async (req, res) => {
+  const signature = req.headers['stripe-signature'];
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, signature, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[stripe-webhook] signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        const supabaseUserId = session.metadata && session.metadata.supabase_user_id;
+        const tier = session.metadata && session.metadata.tier;
+
+        if (!supabaseUserId || !tier) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[stripe-webhook] checkout.session.completed missing metadata, skipping.',
+            session.id
+          );
+          break;
+        }
+
+        const { error } = await supabaseAdmin
+          .from('user_profiles')
+          .update({ tier })
+          .eq('id', supabaseUserId);
+
+        if (error) {
+          // eslint-disable-next-line no-console
+          console.error('[stripe-webhook] failed to update user_profiles:', error);
+        } else {
+          // eslint-disable-next-line no-console
+          console.log(`[stripe-webhook] user ${supabaseUserId} upgraded to tier "${tier}"`);
+        }
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const subscription = event.data.object;
+
+        // Preferred path: we stamped supabase_user_id onto the subscription's
+        // own metadata when creating the Checkout Session (subscription_data
+        // .metadata above), so it is usually available directly here.
+        let supabaseUserId = subscription.metadata && subscription.metadata.supabase_user_id;
+
+        // Fallback path: if metadata isn't present on the subscription for
+        // some reason (e.g. subscription created outside this flow), look it
+        // up via the Stripe Customer's metadata instead. This requires that
+        // the Customer object also has supabase_user_id set at some point
+        // (e.g. by setting `customer_data: { metadata: {...} }` when you
+        // create the customer, or updating it after checkout). See README
+        // "Linking Stripe customers to Supabase users" for details.
+        if (!supabaseUserId && subscription.customer) {
+          const customer = await stripe.customers.retrieve(subscription.customer);
+          if (customer && !customer.deleted) {
+            supabaseUserId = customer.metadata && customer.metadata.supabase_user_id;
+          }
+        }
+
+        if (!supabaseUserId) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[stripe-webhook] customer.subscription.deleted: could not resolve supabase_user_id, skipping.',
+            subscription.id
+          );
+          break;
+        }
+
+        const { error } = await supabaseAdmin
+          .from('user_profiles')
+          .update({ tier: 'free' })
+          .eq('id', supabaseUserId);
+
+        if (error) {
+          // eslint-disable-next-line no-console
+          console.error('[stripe-webhook] failed to downgrade user_profiles:', error);
+        } else {
+          // eslint-disable-next-line no-console
+          console.log(`[stripe-webhook] user ${supabaseUserId} downgraded to "free"`);
+        }
+        break;
+      }
+
+      default:
+        // Unhandled event types are acknowledged but ignored.
+        break;
+    }
+
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[stripe-webhook] handler error:', err);
+    // Still return 200 vs 500 is a judgment call; returning 500 tells Stripe
+    // to retry the event, which is usually what you want for a transient
+    // Supabase failure.
+    return res.status(500).json({ error: 'Webhook handler failed' });
+  }
+});
+
+/**
+ * GET /api/me
+ * Header: Authorization: Bearer <supabase JWT>
+ * Returns: { tier: 'free' | 'seller' | 'business' }
+ */
+app.get('/api/me', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+    if (!token) {
+      return res.status(401).json({ error: 'Missing Authorization: Bearer <token> header' });
+    }
+
+    const user = await getUserFromToken(token);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid or expired auth token' });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('user_profiles')
+      .select('tier')
+      .eq('id', user.id)
+      .single();
+
+    if (error || !data) {
+      // No profile row yet -> treat as free tier by default.
+      return res.json({ tier: 'free' });
+    }
+
+    return res.json({ tier: data.tier || 'free' });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[/api/me] error:', err);
+    return res.status(500).json({ error: 'Failed to fetch user tier' });
+  }
+});
+
+app.listen(PORT, () => {
+  // eslint-disable-next-line no-console
+  console.log(`PricePro backend listening on port ${PORT}`);
+});
