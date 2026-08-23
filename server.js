@@ -9,11 +9,9 @@ const supabase = require('./supabaseClient');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
+app.use(cors({ origin: 'https://pricepro4u.netlify.app', credentials: true }));
 app.use(cookieParser());
 
-// Stripe webhook must read the RAW body, so this route is registered
-// before express.json() — that's required for Stripe's signature check.
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -43,9 +41,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
 app.use(express.json());
 
-// Cookie payload is base64-encoded before signing so it can NEVER contain a
-// "." character — this matters because splitting on "." would otherwise 
-// break for any real email address like "first.last@gmail.com".
 function signCookie(data) {
   const payload = Buffer.from(JSON.stringify(data)).toString('base64');
   const hmac = crypto.createHmac('sha256', process.env.COOKIE_SECRET);
@@ -72,11 +67,14 @@ app.post('/create-checkout-session', async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: `${process.env.BACKEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL}/?canceled=true`,
+      success_url: 'https://pricepro-backend.onrender.com/success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: 'https://pricepro4u.netlify.app/?canceled=true',
     });
     res.json({ url: session.url });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    console.error('Stripe session error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/success', async (req, res) => {
@@ -94,11 +92,14 @@ app.get('/success', async (req, res) => {
     res.cookie('pricepro_session', cookieValue, {
       httpOnly: true,
       secure: true,
-      sameSite: 'none', // required since frontend and backend are on different domains
+      sameSite: 'none',
       maxAge: 2592000000,
     });
-    res.redirect(`${process.env.FRONTEND_URL}/?unlocked=true`);
-  } catch (e) { console.error(e); res.redirect(`${process.env.FRONTEND_URL}/?error=true`); }
+    res.redirect('https://pricepro4u.netlify.app/?unlocked=true');
+  } catch (e) {
+    console.error(e);
+    res.redirect('https://pricepro4u.netlify.app/?error=true');
+  }
 });
 
 app.get('/session', async (req, res) => {
